@@ -6,7 +6,10 @@ import {
   Activity,
   Layers,
   CheckCircle,
-  Clock
+  Clock,
+  Map as MapIcon,
+  Network,
+  Sigma,
 } from 'lucide-react';
 import { CSPSolution, EmergencyIncident, ResourceCenter } from '../types';
 
@@ -18,6 +21,9 @@ interface HeaderProps {
   isSolving: boolean;
   isPlaying: boolean;
   animationCompleted: boolean;
+  viewMode: 'map' | 'graph';
+  onViewModeChange: (mode: 'map' | 'graph') => void;
+  onOpenFormulation: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -28,26 +34,22 @@ export const Header: React.FC<HeaderProps> = ({
   isSolving,
   isPlaying,
   animationCompleted,
+  viewMode,
+  onViewModeChange,
+  onOpenFormulation,
 }) => {
   const totalUnitsRequired = incidents.reduce(
     (acc, inc) => acc + Object.values(inc.required_resources).reduce((a, b) => a + b, 0),
     0
   );
 
-  const totalCapacityAvailable = centers
-    .filter(c => c.operational)
-    .reduce(
-      (acc, c) => acc + Object.values(c.inventory).reduce((a, b) => a + b.available_units, 0),
-      0
-    );
-
-  const activeCentersCount = centers.filter(c => c.operational).length;
+  const activeCentersCount = centers.filter((c) => c.operational).length;
 
   return (
     <header className="h-16 bg-[#0f172a] border-b border-[#1e293b] px-4 flex items-center justify-between shadow-md z-20">
       {/* Title & Branding */}
       <div className="flex items-center gap-3">
-        <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-red-600 to-amber-500 flex items-center justify-center shadow-lg shadow-red-950/50">
+        <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-red-600 to-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-950/50">
           <ShieldAlert className="w-6 h-6 text-white" />
         </div>
         <div>
@@ -61,67 +63,83 @@ export const Header: React.FC<HeaderProps> = ({
             </span>
           </div>
           <p className="text-[11px] text-gray-400 flex items-center gap-2">
-            <span>CSP Resource Allocation & Multimodal Route Visualization</span>
+            <span>Constraint Satisfaction Problem (CSP) Theory & Route Optimization</span>
             <span>•</span>
             <span className="text-cyan-400 font-semibold">{scale} Scale Preset</span>
           </p>
         </div>
       </div>
 
-      {/* Live Operational KPI Badges */}
+      {/* Dual-View Switcher (Map View vs Constraint Graph View) */}
+      <div className="flex items-center bg-[#0b0f19] p-1 rounded-xl border border-gray-800 shadow-inner">
+        <button
+          onClick={() => onViewModeChange('map')}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+            viewMode === 'map'
+              ? 'bg-gradient-to-r from-cyan-600 to-blue-600 text-white shadow'
+              : 'text-gray-400 hover:text-gray-200'
+          }`}
+        >
+          <MapIcon className="w-3.5 h-3.5" />
+          <span>Dhaka Map View</span>
+        </button>
+        <button
+          onClick={() => onViewModeChange('graph')}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+            viewMode === 'graph'
+              ? 'bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow'
+              : 'text-gray-400 hover:text-gray-200'
+          }`}
+        >
+          <Network className="w-3.5 h-3.5" />
+          <span>Constraint Graph & Matrix</span>
+        </button>
+      </div>
+
+      {/* Live Operational KPI Badges & Formulation Link */}
       <div className="flex items-center gap-2.5">
-        <div className="bg-[#1e293b]/70 border border-gray-700 px-3 py-1.5 rounded-lg flex items-center gap-2">
+        <div className="bg-[#1e293b]/70 border border-gray-700 px-3 py-1 rounded-lg flex items-center gap-2">
           <Flame className="w-4 h-4 text-amber-400" />
           <div className="text-left">
-            <div className="text-[10px] text-gray-400 font-medium uppercase leading-none">Incidents</div>
+            <div className="text-[9px] text-gray-400 font-medium uppercase leading-none">Incidents</div>
             <div className="text-xs font-mono font-bold text-gray-100">{incidents.length}</div>
           </div>
         </div>
 
-        <div className="bg-[#1e293b]/70 border border-gray-700 px-3 py-1.5 rounded-lg flex items-center gap-2">
+        <div className="bg-[#1e293b]/70 border border-gray-700 px-3 py-1 rounded-lg flex items-center gap-2">
           <Layers className="w-4 h-4 text-cyan-400" />
           <div className="text-left">
-            <div className="text-[10px] text-gray-400 font-medium uppercase leading-none">CSP Variables (X)</div>
+            <div className="text-[9px] text-gray-400 font-medium uppercase leading-none">Variables (X)</div>
             <div className="text-xs font-mono font-bold text-cyan-300">{totalUnitsRequired}</div>
           </div>
         </div>
 
-        <div className="bg-[#1e293b]/70 border border-gray-700 px-3 py-1.5 rounded-lg flex items-center gap-2">
+        <div className="bg-[#1e293b]/70 border border-gray-700 px-3 py-1 rounded-lg flex items-center gap-2">
           <Truck className="w-4 h-4 text-emerald-400" />
           <div className="text-left">
-            <div className="text-[10px] text-gray-400 font-medium uppercase leading-none">Allocated</div>
+            <div className="text-[9px] text-gray-400 font-medium uppercase leading-none">Allocated</div>
             <div className="text-xs font-mono font-bold text-emerald-400">
               {solution ? `${solution.allocated_count} / ${solution.total_variables}` : '—'}
             </div>
           </div>
         </div>
 
-        <div className="bg-[#1e293b]/70 border border-gray-700 px-3 py-1.5 rounded-lg flex items-center gap-2">
-          <Activity className="w-4 h-4 text-purple-400" />
-          <div className="text-left">
-            <div className="text-[10px] text-gray-400 font-medium uppercase leading-none">Active Centers</div>
-            <div className="text-xs font-mono font-bold text-gray-200">
-              {activeCentersCount} / {centers.length}
-            </div>
-          </div>
-        </div>
-
         {/* Solver Execution State Badge */}
-        <div className="pl-2 border-l border-gray-700">
+        <div className="pl-1 border-l border-gray-700">
           {isSolving ? (
             <span className="px-2.5 py-1 rounded-md text-xs font-bold bg-cyan-950 text-cyan-300 border border-cyan-800 flex items-center gap-1.5 animate-pulse">
               <span className="w-2 h-2 rounded-full bg-cyan-400 animate-spin" />
-              Solving CSP...
+              Solving...
             </span>
           ) : isPlaying ? (
             <span className="px-2.5 py-1 rounded-md text-xs font-bold bg-amber-950 text-amber-300 border border-amber-800 flex items-center gap-1.5">
               <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
-              Replaying Trace
+              Trace Replay
             </span>
           ) : animationCompleted ? (
             <span className="px-2.5 py-1 rounded-md text-xs font-bold bg-emerald-950 text-emerald-300 border border-emerald-800 flex items-center gap-1.5">
               <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />
-              Routes Dispatched
+              Dispatched
             </span>
           ) : (
             <span className="px-2.5 py-1 rounded-md text-xs font-bold bg-gray-800 text-gray-300 border border-gray-700 flex items-center gap-1.5">

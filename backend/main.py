@@ -15,17 +15,17 @@ from backend.models import (
 from backend.graph_loader import dhaka_network
 from backend.dhaka_landmarks import DHAKA_LANDMARKS, RAW_RESOURCE_CENTERS
 from backend.scale_generator import generate_scale_scenario
-from backend.csp_solver import CSPSolver
+from backend.csp_formulation import DhakaEmergencyCSP, export_formulation_snapshot
+from backend.csp_solver import CSPSolverEngine
 
 logger = logging.getLogger("dhaka_control_center")
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(
     title="Dhaka Emergency Response Control Center — CSP Resource Allocation API",
-    version="1.0.0"
+    version="2.0.0"
 )
 
-# Enable CORS for frontend Vite server
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,7 +34,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-Memory State
 class GlobalState:
     def __init__(self):
         self.scale: str = "Small"
@@ -61,7 +60,10 @@ def startup_event():
 
 @app.get("/api/init")
 def get_init_data():
-    """Returns network summary, centers, landmarks, and active scenario."""
+    """Returns network summary, centers, landmarks, active scenario, and formulation snapshot."""
+    csp = DhakaEmergencyCSP(state.incidents, state.centers)
+    formulation_snapshot = export_formulation_snapshot(csp)
+
     return {
         "status": "ready",
         "scale": state.scale,
@@ -79,8 +81,28 @@ def get_init_data():
         "landmarks": DHAKA_LANDMARKS,
         "centers": state.centers,
         "incidents": state.incidents,
-        "roadblocks": state.active_roadblocks
+        "roadblocks": state.active_roadblocks,
+        "formulation": formulation_snapshot
     }
+
+@app.get("/api/csp/formulation")
+def get_csp_formulation():
+    """Returns the formal (X, D, C) tuple, Constraint Graph, and Independent Subproblems."""
+    csp = DhakaEmergencyCSP(state.incidents, state.centers)
+    return export_formulation_snapshot(csp)
+
+@app.get("/api/csp/formulation-doc")
+def get_formulation_document():
+    """Returns the academic CSP_FORMULATION.md specification document."""
+    doc_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "CSP_FORMULATION.md")
+    if not os.path.exists(doc_path):
+        doc_path = "CSP_FORMULATION.md"
+
+    if os.path.exists(doc_path):
+        with open(doc_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return {"markdown": content}
+    return {"markdown": "# CSP Technical Specification\nDocument not found on disk."}
 
 class ScaleRequest(BaseModel):
     scale: str
@@ -93,12 +115,17 @@ def generate_scale(req: ScaleRequest):
     dhaka_network.clear_hazard_zones()
     state.active_roadblocks.clear()
     state.reset_to_scale(req.scale)
+
+    csp = DhakaEmergencyCSP(state.incidents, state.centers)
+    formulation_snapshot = export_formulation_snapshot(csp)
+
     return {
         "scale": state.scale,
         "incidents": state.incidents,
         "centers": state.centers,
         "total_incidents": len(state.incidents),
-        "total_centers": len(state.centers)
+        "total_centers": len(state.centers),
+        "formulation": formulation_snapshot
     }
 
 @app.post("/api/solve-csp", response_model=CSPSolution)
@@ -112,26 +139,21 @@ def solve_csp(req: CSPSolveRequest):
         for r_type, inv in c.inventory.items():
             inv.available_units = inv.total_capacity
 
-    solver = CSPSolver(
+    engine = CSPSolverEngine(
         incidents=state.incidents,
         centers=state.centers,
-        algorithm=req.algorithm,
-        use_mrv=req.use_mrv,
-        use_degree=req.use_degree,
-        use_lcv=req.use_lcv,
-        use_nearest_center=req.use_nearest_center,
-        scale=state.scale,
-        time_limit_sec=req.time_limit_sec
+        solve_request=req,
+        scale=state.scale
     )
-    solution = solver.solve()
+    solution = engine.solve()
     state.last_solution = solution
 
     # Update incident statuses based on assignments
     for inc in state.incidents:
         assigned_units = 0
         total_units = sum(inc.required_resources.values())
-        for var_id, cid in solution.assignments.items():
-            if f"_{inc.id}_" in var_id and cid is not None:
+        for var_id, uid in solution.assignments.items():
+            if f"_{inc.id}_" in var_id and uid is not None:
                 assigned_units += 1
         if assigned_units == total_units:
             inc.status = "ASSIGNED"
@@ -146,8 +168,8 @@ def solve_csp(req: CSPSolveRequest):
 def escalate_incident(req: EscalateRequest):
     """
     Dynamic Situation Escalation ("Worsening Situation"):
-    Spawns high-priority sub-requests for extra resources (e.g. +2 Ambulances, +1 Rescue Team)
-    forcing the CSP solver to re-allocate from remaining available centers.
+    Spawns high-priority sub-requests for extra resources (e.g. +2 Ambulances, +1 Rescue Team).
+    Supports fast local repair using Min-Conflicts without restarting systematic search from scratch.
     """
     inc = next((i for i in state.incidents if i.id == req.incident_id), None)
     if not inc:
@@ -155,12 +177,12 @@ def escalate_incident(req: EscalateRequest):
 
     inc.escalated = True
     inc.escalation_count += 1
-    inc.priority = 5  # Elevated to Critical
+    inc.priority = 5
     inc.time_max_minutes = PRIORITY_MAX_TIMES[5]
     inc.budget_max += 10000.0
     inc.status = "ESCALATED"
 
-    # Add extra resources demanded by disaster escalation
+    # Spawn disaster escalation requirements
     if inc.category in ("Fire", "Earthquake"):
         inc.required_resources["Ambulance"] = inc.required_resources.get("Ambulance", 0) + 2
         inc.required_resources["Fire Brigade"] = inc.required_resources.get("Fire Brigade", 0) + 1
@@ -175,10 +197,23 @@ def escalate_incident(req: EscalateRequest):
         inc.required_resources["Ambulance"] = inc.required_resources.get("Ambulance", 0) + 1
         inc.required_resources["Rescue Team"] = inc.required_resources.get("Rescue Team", 0) + 1
 
+    repaired_solution = None
+    if req.repair_method == "min_conflicts" and state.last_solution:
+        # Fast local repair using Min-Conflicts
+        engine = CSPSolverEngine(
+            incidents=state.incidents,
+            centers=state.centers,
+            solve_request=CSPSolveRequest(algorithm="min_conflicts", max_steps=150),
+            scale=state.scale
+        )
+        repaired_solution = engine.solve_min_conflicts(initial_assignments=state.last_solution.assignments)
+        state.last_solution = repaired_solution
+
     return {
         "success": True,
         "escalated_incident": inc,
-        "incidents": state.incidents
+        "incidents": state.incidents,
+        "repaired_solution": repaired_solution
     }
 
 class BenchmarkRequest(BaseModel):
@@ -187,48 +222,69 @@ class BenchmarkRequest(BaseModel):
 @app.post("/api/benchmark", response_model=BenchmarkResponse)
 def run_benchmark(req: BenchmarkRequest):
     """
-    Runs scale benchmark comparing:
-    - Standard Backtracking (BT)
-    - Conflict-Directed Backjumping (CBJ)
-    - AC-3 + Backtracking (MAC)
-    - Full Heuristics (MRV + LCV + AC3 + CBJ)
-    across the current scale.
+    Runs comprehensive benchmark comparing all 3 main solver families:
+    1. Backtracking (Pure BT)
+    2. Backtracking (BT + Forward Checking + MRV/Degree)
+    3. Backtracking (BT + MAC + LCV)
+    4. Conflict-Directed Backjumping (CBJ + FC + MRV)
+    5. Local Search (Min-Conflicts - Greedy Nearest)
+    6. Local Search (Min-Conflicts - Random Walk/Restart)
     """
     target_scale = req.scale or state.scale
     bench_incidents, bench_centers = generate_scale_scenario(target_scale)
 
     configurations = [
         {
-            "name": "Standard Backtracking (BT)",
+            "name": "Backtracking (Pure BT)",
+            "family": "Backtracking",
             "algorithm": "backtracking",
-            "mrv": False,
-            "degree": False,
-            "lcv": False,
-            "nearest": True
+            "inference": "none",
+            "var_h": "priority",
+            "val_h": "nearest",
+            "nc": False, "ac3": False, "pc": False
         },
         {
-            "name": "Conflict-Directed Backjumping (CBJ)",
+            "name": "Backtracking (BT + FC + MRV/Degree)",
+            "family": "Backtracking",
+            "algorithm": "backtracking",
+            "inference": "forward_checking",
+            "var_h": "mrv_degree",
+            "val_h": "nearest",
+            "nc": True, "ac3": False, "pc": False
+        },
+        {
+            "name": "Backtracking (BT + MAC + LCV)",
+            "family": "Backtracking",
+            "algorithm": "backtracking",
+            "inference": "mac",
+            "var_h": "mrv_degree",
+            "val_h": "lcv",
+            "nc": True, "ac3": True, "pc": False
+        },
+        {
+            "name": "Conflict-Directed Backjumping (CBJ + FC + MRV)",
+            "family": "Backjumping",
             "algorithm": "backjumping",
-            "mrv": False,
-            "degree": False,
-            "lcv": False,
-            "nearest": True
+            "inference": "forward_checking",
+            "var_h": "mrv_degree",
+            "val_h": "lcv",
+            "nc": True, "ac3": True, "pc": False
         },
         {
-            "name": "AC-3 + Backtracking",
-            "algorithm": "ac3_backtracking",
-            "mrv": True,
-            "degree": True,
-            "lcv": False,
-            "nearest": True
+            "name": "Local Search (Min-Conflicts - Greedy)",
+            "family": "Local Search",
+            "algorithm": "min_conflicts",
+            "strategy": "nearest",
+            "walk_p": 0.0,
+            "nc": True, "ac3": False, "pc": False
         },
         {
-            "name": "Full Heuristics (MRV+LCV+AC3+CBJ)",
-            "algorithm": "path_consistency_cbj",
-            "mrv": True,
-            "degree": True,
-            "lcv": True,
-            "nearest": True
+            "name": "Local Search (Min-Conflicts - Random Walk/Restart)",
+            "family": "Local Search",
+            "algorithm": "min_conflicts",
+            "strategy": "nearest",
+            "walk_p": 0.08,
+            "nc": True, "ac3": False, "pc": False
         }
     ]
 
@@ -236,37 +292,55 @@ def run_benchmark(req: BenchmarkRequest):
     total_vars = 0
 
     for cfg in configurations:
-        # Reset centers
         test_centers = copy.deepcopy(bench_centers)
         test_incidents = copy.deepcopy(bench_incidents)
 
-        solver = CSPSolver(
-            incidents=test_incidents,
-            centers=test_centers,
+        solve_req = CSPSolveRequest(
             algorithm=cfg["algorithm"],
-            use_mrv=cfg["mrv"],
-            use_degree=cfg["degree"],
-            use_lcv=cfg["lcv"],
-            use_nearest_center=cfg["nearest"],
-            scale=target_scale,
+            use_node_consistency=cfg.get("nc", True),
+            use_ac3=cfg.get("ac3", False),
+            use_path_consistency=cfg.get("pc", False),
+            inference=cfg.get("inference", "forward_checking"),
+            var_heuristic=cfg.get("var_h", "mrv_degree"),
+            val_heuristic=cfg.get("val_h", "lcv"),
+            initial_strategy=cfg.get("strategy", "nearest"),
+            random_walk_prob=cfg.get("walk_p", 0.05),
+            max_steps=350,
             time_limit_sec=12.0
         )
-        sol = solver.solve()
+
+        engine = CSPSolverEngine(
+            incidents=test_incidents,
+            centers=test_centers,
+            solve_request=solve_req,
+            scale=target_scale
+        )
+        sol = engine.solve()
         total_vars = sol.total_variables
         alloc_rate = round((sol.allocated_count / max(1, sol.total_variables)) * 100.0, 1)
 
+        states_repairs = sol.states_explored if cfg["family"] != "Local Search" else sol.repairs_count
+
+        # Estimate memory profile based on tree depth or flat state
+        mem_kb = round(len(engine.csp.variables) * (len(engine.csp.physical_units) * 0.12 if cfg["family"] != "Local Search" else 0.08), 2)
+
         metrics_list.append(BenchmarkMetric(
             algorithm=cfg["name"],
+            algorithm_family=cfg["family"],
             scale=target_scale,
+            status=sol.status,
             allocated_count=sol.allocated_count,
             total_variables=sol.total_variables,
             allocation_rate_pct=alloc_rate,
             total_travel_time_min=sol.total_travel_time_min,
             total_cost=sol.total_cost,
-            states_explored=sol.states_explored,
+            states_or_repairs=states_repairs,
             backtracks=sol.backtracks,
             backjumps=sol.backjumps,
-            domain_values_pruned=sol.domain_values_pruned,
+            skipped_levels=engine.skipped_levels_total,
+            domains_pruned=sol.domain_values_pruned,
+            final_conflicts=sol.final_conflicts,
+            memory_profile_kb=mem_kb,
             execution_time_ms=sol.execution_time_ms
         ))
 
@@ -279,8 +353,6 @@ def run_benchmark(req: BenchmarkRequest):
 
 @app.post("/api/constraints/road")
 def toggle_road_block(req: RoadBlockConstraint):
-    """Adds or removes a road block / hazard constraint on an edge."""
-    # Find nearest nodes if not provided
     dhaka_network.set_edge_constraint(
         u=req.u,
         v=req.v,
@@ -303,13 +375,11 @@ def toggle_road_block(req: RoadBlockConstraint):
 
 @app.post("/api/constraints/hazard-zone")
 def create_hazard_zone(lat: float, lng: float, radius: float = 800.0):
-    """Simulates earthquake / flood damage making roads in a radius impassable."""
     affected = dhaka_network.add_hazard_zone(lat, lng, radius)
     return {"success": True, "affected_edges": affected, "hazard_zones": dhaka_network.hazard_zones}
 
 @app.post("/api/constraints/center")
 def toggle_center_operational(req: ToggleCenterRequest):
-    """Toggles Resource Center online/offline (Resource Center Availability constraint C7)."""
     center = next((c for c in state.centers if c.id == req.center_id), None)
     if not center:
         raise HTTPException(status_code=404, detail="Center not found.")
@@ -323,7 +393,6 @@ def toggle_center_operational(req: ToggleCenterRequest):
 
 @app.post("/api/add-incident")
 def add_custom_incident(req: AddIncidentRequest):
-    """Adds a new incident clicked by the user on the map."""
     node_id = dhaka_network.find_nearest_node(req.lat, req.lng)
     inc_id = f"INC-USR-{len(state.incidents)+1:03d}"
 
@@ -353,7 +422,6 @@ def add_custom_incident(req: AddIncidentRequest):
 
 @app.post("/api/reset")
 def reset_system():
-    """Resets scenario, cleared routes, and restorations."""
     dhaka_network.clear_hazard_zones()
     state.active_roadblocks.clear()
     state.reset_to_scale(state.scale)

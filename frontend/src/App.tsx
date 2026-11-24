@@ -2,9 +2,11 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Header } from './components/Header';
 import { ControlPanel } from './components/ControlPanel';
 import { MapViewer } from './components/MapViewer';
+import { ConstraintGraphViewer } from './components/ConstraintGraphViewer';
 import { AnimationControls } from './components/AnimationControls';
 import { CSPInspector } from './components/CSPInspector';
 import { BenchmarkModal } from './components/BenchmarkModal';
+import { CSPFormulationModal } from './components/CSPFormulationModal';
 import {
   EmergencyIncident,
   ResourceCenter,
@@ -14,7 +16,9 @@ import {
   ClickMode,
   EmergencyCategory,
   BenchmarkResponse,
-  RoadBlockConstraint
+  RoadBlockConstraint,
+  CSPSolveRequest,
+  FormulationSnapshot,
 } from './types';
 
 export const App: React.FC = () => {
@@ -24,17 +28,33 @@ export const App: React.FC = () => {
   const [centers, setCenters] = useState<ResourceCenter[]>([]);
   const [roadblocks, setRoadblocks] = useState<RoadBlockConstraint[]>([]);
 
+  // Dual View Mode: Map View vs Constraint Graph View
+  const [viewMode, setViewMode] = useState<'map' | 'graph'>('map');
+
   // Interaction Mode State
   const [clickMode, setClickMode] = useState<ClickMode>('inspect');
   const [newIncidentCategory, setNewIncidentCategory] = useState<EmergencyCategory>('Fire');
   const [newIncidentPriority, setNewIncidentPriority] = useState<number>(4);
 
-  // CSP Solver Configuration
-  const [algorithm, setAlgorithm] = useState<string>('path_consistency_cbj');
-  const [useMrv, setUseMrv] = useState<boolean>(true);
-  const [useDegree, setUseDegree] = useState<boolean>(true);
-  const [useLcv, setUseLcv] = useState<boolean>(true);
-  const [useNearestCenter, setUseNearestCenter] = useState<boolean>(true);
+  // Formal CSP Formulation State
+  const [formulation, setFormulation] = useState<FormulationSnapshot | null>(null);
+  const [isFormulationModalOpen, setIsFormulationModalOpen] = useState<boolean>(false);
+
+  // CSP Solver Configuration (3 Main Algorithms + Consistency + Heuristics)
+  const [solveRequest, setSolveRequest] = useState<CSPSolveRequest>({
+    algorithm: 'backjumping',
+    use_node_consistency: true,
+    use_ac3: true,
+    use_path_consistency: false,
+    inference: 'forward_checking',
+    var_heuristic: 'mrv_degree',
+    val_heuristic: 'lcv',
+    max_steps: 300,
+    initial_strategy: 'nearest',
+    random_walk_prob: 0.05,
+    allow_random_restart: true,
+    time_limit_sec: 15.0,
+  });
   const [isSolving, setIsSolving] = useState<boolean>(false);
 
   // Solution & Step-by-Step Animation State
@@ -52,6 +72,19 @@ export const App: React.FC = () => {
   // Animation Timer Reference
   const timerRef = useRef<any>(null);
 
+  // Fetch Formulation Snapshot from Backend
+  const fetchFormulation = useCallback(async () => {
+    try {
+      const res = await fetch('/api/csp/formulation');
+      if (res.ok) {
+        const data: FormulationSnapshot = await res.json();
+        setFormulation(data);
+      }
+    } catch (err) {
+      console.error('Failed to load CSP formulation snapshot:', err);
+    }
+  }, []);
+
   // Load Initial State from Backend
   const fetchInitData = useCallback(async () => {
     try {
@@ -61,10 +94,11 @@ export const App: React.FC = () => {
       setIncidents(data.incidents || []);
       setCenters(data.centers || []);
       setRoadblocks(data.roadblocks || []);
+      await fetchFormulation();
     } catch (err) {
       console.error('Failed to load initial data from backend:', err);
     }
-  }, []);
+  }, [fetchFormulation]);
 
   useEffect(() => {
     fetchInitData();
@@ -88,9 +122,15 @@ export const App: React.FC = () => {
       setScale(data.scale);
       setIncidents(data.incidents);
       setCenters(data.centers);
+      await fetchFormulation();
     } catch (err) {
       console.error('Error switching scale:', err);
     }
+  };
+
+  // Update Solver Request Parameters
+  const handleUpdateSolveRequest = (updates: Partial<CSPSolveRequest>) => {
+    setSolveRequest((prev) => ({ ...prev, ...updates }));
   };
 
   // Execute CSP Solve
@@ -105,14 +145,7 @@ export const App: React.FC = () => {
       const res = await fetch('/api/solve-csp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          algorithm,
-          use_mrv: useMrv,
-          use_degree: useDegree,
-          use_lcv: useLcv,
-          use_nearest_center: useNearestCenter,
-          time_limit_sec: 15.0,
-        }),
+        body: JSON.stringify(solveRequest),
       });
 
       if (!res.ok) {
@@ -123,6 +156,7 @@ export const App: React.FC = () => {
       setSolution(sol);
       setCurrentStep(1);
       setIsPlaying(true);
+      await fetchFormulation();
     } catch (err) {
       console.error('Error running CSP solver:', err);
       alert('Failed to solve CSP. Check backend server logs.');
@@ -142,11 +176,11 @@ export const App: React.FC = () => {
       return;
     }
 
-    // Interval inversely proportional to speed (1000ms at 1x down to 10ms at 100x)
-    const delay = Math.max(8, Math.round(500 / speed));
+    // Interval inversely proportional to speed
+    const delay = Math.max(6, Math.round(500 / speed));
 
     timerRef.current = setTimeout(() => {
-      setCurrentStep(prev => {
+      setCurrentStep((prev) => {
         const next = prev + 1;
         if (next >= total) {
           setIsPlaying(false);
@@ -167,20 +201,28 @@ export const App: React.FC = () => {
       setCurrentStep(0);
       setAnimationCompleted(false);
     }
-    setIsPlaying(prev => !prev);
+    setIsPlaying((prev) => !prev);
   };
 
   const handleStepForward = () => {
     if (!solution || !solution.trace_events) return;
     setIsPlaying(false);
     if (timerRef.current) clearTimeout(timerRef.current);
-    setCurrentStep(prev => {
+    setCurrentStep((prev) => {
       const next = Math.min(solution.trace_events.length, prev + 1);
       if (next >= solution.trace_events.length) {
         setAnimationCompleted(true);
       }
       return next;
     });
+  };
+
+  const handleStepBackward = () => {
+    if (!solution || !solution.trace_events) return;
+    setIsPlaying(false);
+    if (timerRef.current) clearTimeout(timerRef.current);
+    setCurrentStep((prev) => Math.max(0, prev - 1));
+    setAnimationCompleted(false);
   };
 
   const handleSkipToEnd = () => {
@@ -198,7 +240,7 @@ export const App: React.FC = () => {
     setAnimationCompleted(false);
   };
 
-  // Reset Entire System Scenario
+  // Reset Entire Scenario
   const handleResetScenario = async () => {
     setIsPlaying(false);
     if (timerRef.current) clearTimeout(timerRef.current);
@@ -219,20 +261,33 @@ export const App: React.FC = () => {
 
   // Incident Escalation Handler ("Worsening Situation")
   const handleIncidentClick = async (incident: EmergencyIncident) => {
-    if (clickMode === 'escalate' || window.confirm(`Escalate ${incident.title} (Request Urgent Backup)?`)) {
+    if (
+      clickMode === 'escalate' ||
+      window.confirm(`Escalate ${incident.title} (Request Urgent Backup Units)?`)
+    ) {
       try {
         const res = await fetch('/api/escalate-incident', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ incident_id: incident.id }),
+          body: JSON.stringify({
+            incident_id: incident.id,
+            repair_method: 'min_conflicts',
+          }),
         });
         const data = await res.json();
         if (data.success) {
           setIncidents(data.incidents);
-          // Invalidate current routes to prompt re-solve
-          setSolution(null);
-          setCurrentStep(0);
-          setAnimationCompleted(false);
+          const repSol = data.solution || data.repaired_solution;
+          if (repSol) {
+            setSolution(repSol);
+            setCurrentStep(repSol.trace_events.length);
+            setAnimationCompleted(true);
+          } else {
+            setSolution(null);
+            setCurrentStep(0);
+            setAnimationCompleted(false);
+          }
+          await fetchFormulation();
         }
       } catch (err) {
         console.error('Error escalating incident:', err);
@@ -255,6 +310,7 @@ export const App: React.FC = () => {
           setSolution(null);
           setCurrentStep(0);
           setAnimationCompleted(false);
+          await fetchFormulation();
         }
       } catch (err) {
         console.error('Error toggling center operational state:', err);
@@ -283,19 +339,20 @@ export const App: React.FC = () => {
           setCurrentStep(0);
           setAnimationCompleted(false);
           setClickMode('inspect');
+          await fetchFormulation();
         }
       } catch (err) {
         console.error('Error adding incident:', err);
       }
     } else if (clickMode === 'block_road') {
-      // Simulate road obstruction / flood hazard zone
       try {
-        const res = await fetch(`/api/constraints/hazard-zone?lat=${lat}&lng=${lng}&radius=600`, {
-          method: 'POST',
-        });
+        const res = await fetch(
+          `/api/constraints/hazard-zone?lat=${lat}&lng=${lng}&radius=600`,
+          { method: 'POST' }
+        );
         const data = await res.json();
         if (data.success) {
-          setRoadblocks(prev => [
+          setRoadblocks((prev) => [
             ...prev,
             {
               u: 0,
@@ -318,7 +375,7 @@ export const App: React.FC = () => {
     }
   };
 
-  // Run Scale Benchmark
+  // Run Benchmark across all 6 configurations
   const handleRunBenchmark = async (targetScale: string) => {
     setIsBenchmarkLoading(true);
     try {
@@ -337,7 +394,7 @@ export const App: React.FC = () => {
   };
 
   // Compute Active Routes to render on map:
-  // RULE: DO NOT draw the final dispatch route polylines before the step-by-step CSP animation finishes!
+  // RULE: DO NOT draw the final dispatch route polylines before the step-by-step animation finishes!
   // If animation is complete or skipped, show all solution routes.
   // While animation is playing, show only routes for variables that have received ASSIGN_SUCCESS up to currentStep!
   const activeRoutesToRender: RouteInfo[] = React.useMemo(() => {
@@ -345,21 +402,26 @@ export const App: React.FC = () => {
     if (animationCompleted || currentStep >= (solution.trace_events.length || 0)) {
       return solution.routes;
     }
-    // Collect variables assigned up to currentStep
     const assignedVarIds = new Set<string>();
     const traceSlice = solution.trace_events.slice(0, currentStep);
-    traceSlice.forEach(evt => {
-      if (evt.event_type === 'ASSIGN_SUCCESS' && evt.var_id) {
+    traceSlice.forEach((evt) => {
+      if (
+        (evt.event_type === 'ASSIGN_SUCCESS' || evt.event_type === 'LOCAL_REPAIR') &&
+        evt.var_id
+      ) {
         assignedVarIds.add(evt.var_id);
-      } else if ((evt.event_type === 'BACKTRACK' || evt.event_type === 'BACKJUMP') && evt.var_id) {
+      } else if (
+        (evt.event_type === 'BACKTRACK' || evt.event_type === 'CBJ_BACKJUMP') &&
+        evt.var_id
+      ) {
         assignedVarIds.delete(evt.var_id);
         if (evt.skipped_vars) {
-          evt.skipped_vars.forEach(sv => assignedVarIds.delete(sv));
+          evt.skipped_vars.forEach((sv) => assignedVarIds.delete(sv));
         }
       }
     });
 
-    return solution.routes.filter(r => assignedVarIds.has(r.var_id));
+    return solution.routes.filter((r) => assignedVarIds.has(r.var_id));
   }, [solution, currentStep, animationCompleted]);
 
   // Current Trace Event for candidate probing lines & conflict animations
@@ -379,9 +441,12 @@ export const App: React.FC = () => {
         isSolving={isSolving}
         isPlaying={isPlaying}
         animationCompleted={animationCompleted}
+        viewMode={viewMode}
+        onViewModeChange={setViewMode}
+        onOpenFormulation={() => setIsFormulationModalOpen(true)}
       />
 
-      {/* Main Workspace: Left Controls, Central Map Canvas, Right CSP Inspector */}
+      {/* Main Workspace: Left Controls, Central Canvas (Map or Constraint Graph), Right Inspector */}
       <div className="flex flex-1 w-full h-[calc(100vh-64px)] relative overflow-hidden">
         {/* Left Sidebar Control Panel */}
         <ControlPanel
@@ -389,16 +454,8 @@ export const App: React.FC = () => {
           onScaleChange={handleScaleChange}
           clickMode={clickMode}
           onClickModeChange={setClickMode}
-          algorithm={algorithm}
-          onAlgorithmChange={setAlgorithm}
-          useMrv={useMrv}
-          onToggleMrv={setUseMrv}
-          useDegree={useDegree}
-          onToggleDegree={setUseDegree}
-          useLcv={useLcv}
-          onToggleLcv={setUseLcv}
-          useNearestCenter={useNearestCenter}
-          onToggleNearestCenter={setUseNearestCenter}
+          solveRequest={solveRequest}
+          onUpdateSolveRequest={handleUpdateSolveRequest}
           onSolve={handleSolveCSP}
           onReset={handleResetScenario}
           onOpenBenchmark={() => {
@@ -407,6 +464,7 @@ export const App: React.FC = () => {
               handleRunBenchmark(scale);
             }
           }}
+          onOpenFormulation={() => setIsFormulationModalOpen(true)}
           isSolving={isSolving}
           newIncidentCategory={newIncidentCategory}
           onNewIncidentCategoryChange={setNewIncidentCategory}
@@ -414,49 +472,66 @@ export const App: React.FC = () => {
           onNewIncidentPriorityChange={setNewIncidentPriority}
         />
 
-        {/* Central Map Canvas */}
-        <div className="flex-1 h-full relative overflow-hidden bg-[#0d131f]">
-          <MapViewer
-            incidents={incidents}
-            centers={centers}
-            activeRoutes={activeRoutesToRender}
-            currentTraceEvent={currentTraceEvent}
-            animationCompleted={animationCompleted}
-            clickMode={clickMode}
-            onMapClick={handleMapClick}
-            onIncidentClick={handleIncidentClick}
-            onCenterClick={handleCenterClick}
-            roadblocks={roadblocks}
-          />
+        {/* Central Workspace: Either MapViewer or ConstraintGraphViewer */}
+        <div className="flex-1 h-full relative overflow-hidden bg-[#0d131f] p-1">
+          {viewMode === 'map' ? (
+            <>
+              <MapViewer
+                incidents={incidents}
+                centers={centers}
+                activeRoutes={activeRoutesToRender}
+                currentTraceEvent={currentTraceEvent}
+                animationCompleted={animationCompleted}
+                clickMode={clickMode}
+                onMapClick={handleMapClick}
+                onIncidentClick={handleIncidentClick}
+                onCenterClick={handleCenterClick}
+                roadblocks={roadblocks}
+              />
 
-          {/* Floating Animation Controls at bottom */}
-          {solution && solution.trace_events.length > 0 && (
-            <AnimationControls
-              isPlaying={isPlaying}
-              onTogglePlay={handleTogglePlay}
-              onStepForward={handleStepForward}
-              onSkipToEnd={handleSkipToEnd}
-              onResetAnimation={handleResetAnimation}
-              currentStep={currentStep}
-              totalSteps={solution.trace_events.length}
-              speed={speed}
-              onSpeedChange={setSpeed}
-              disabled={isSolving}
-            />
-          )}
+              {/* Floating Animation Controls at bottom */}
+              {solution && solution.trace_events.length > 0 && (
+                <AnimationControls
+                  isPlaying={isPlaying}
+                  onTogglePlay={handleTogglePlay}
+                  onStepForward={handleStepForward}
+                  onStepBackward={handleStepBackward}
+                  onSkipToEnd={handleSkipToEnd}
+                  onResetAnimation={handleResetAnimation}
+                  currentStep={currentStep}
+                  totalSteps={solution.trace_events.length}
+                  speed={speed}
+                  onSpeedChange={setSpeed}
+                  disabled={isSolving}
+                />
+              )}
 
-          {/* Click Mode Prompt Banner */}
-          {clickMode !== 'inspect' && (
-            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[1000] bg-amber-500/90 text-black px-4 py-1.5 rounded-full font-bold text-xs shadow-xl animate-bounce flex items-center gap-2">
-              <span>Tool Active:</span>
-              <span className="uppercase">{clickMode.replace('_', ' ')}</span>
-              <span>— Click map/marker to execute</span>
-              <button
-                onClick={() => setClickMode('inspect')}
-                className="ml-2 bg-black/80 text-white rounded-full px-2 py-0.5 text-[10px] hover:bg-black"
-              >
-                Cancel
-              </button>
+              {/* Click Mode Prompt Banner */}
+              {clickMode !== 'inspect' && (
+                <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[1000] bg-amber-500/90 text-black px-4 py-1.5 rounded-full font-bold text-xs shadow-xl animate-bounce flex items-center gap-2">
+                  <span>Tool Active:</span>
+                  <span className="uppercase">{clickMode.replace('_', ' ')}</span>
+                  <span>— Click map/marker to execute</span>
+                  <button
+                    onClick={() => setClickMode('inspect')}
+                    className="ml-2 bg-black/80 text-white rounded-full px-2 py-0.5 text-[10px] hover:bg-black"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+            </>
+          ) : (
+            /* Constraint Graph & Domain Matrix View */
+            <div className="h-full w-full p-2">
+              <ConstraintGraphViewer
+                nodes={formulation?.constraint_graph.nodes || []}
+                edges={formulation?.constraint_graph.edges || []}
+                subproblems={formulation?.constraint_graph.subproblems || []}
+                initialDomains={formulation?.formal_tuple.initial_domains || {}}
+                currentEvent={currentTraceEvent}
+                solution={solution}
+              />
             </div>
           )}
         </div>
@@ -478,6 +553,13 @@ export const App: React.FC = () => {
         benchmarkData={benchmarkData}
         isLoading={isBenchmarkLoading}
         currentScale={scale}
+      />
+
+      {/* Formal CSP Formulation Modal */}
+      <CSPFormulationModal
+        isOpen={isFormulationModalOpen}
+        onClose={() => setIsFormulationModalOpen(false)}
+        formulation={formulation}
       />
     </div>
   );
